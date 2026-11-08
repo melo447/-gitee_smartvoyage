@@ -274,7 +274,9 @@ class TripQueryServer(A2AServer):
                     # 询问缺失信息的模式
                     "哪个城市", "什么城市", "哪一天", "哪个日期",
                     "具体日期", "取车城市", "没有提供",
-                    "信息不足", "暂未找到", "未找到",
+                    # 注意："未找到/暂未找到"属于查询无结果(no_data)，不是缺少参数，
+                    # 由下方 is_no_data 分支单独处理
+                    "信息不足",
                     # 询问用户需求的模式
                     "请问您需要", "请问您想", "请问您要",
                     "请告诉我您的", "请说明", "需要以下信息",
@@ -283,8 +285,16 @@ class TripQueryServer(A2AServer):
                     "无法为您", "暂时无法", "需要先"
                 ]
                 is_follow_up = any(keyword in result_text for keyword in follow_up_keywords)
+                # 先判定"查无数据"：查询已经执行但没有结果，属于 no_data；
+                # 不能因为回复里带"请确认"等追问字样就误判成缺少参数
+                no_data_keywords = ["未找到", "暂未找到", "没有找到", "暂无相关", "无相关"]
+                is_no_data = any(keyword in result_text for keyword in no_data_keywords)
 
-                if is_follow_up:
+                if is_no_data:
+                    # 查询完成但无数据，交给主服务如实告知并引导调整条件
+                    task.artifacts = [{"parts": [{"type": "text", "text": result_text}]}]
+                    task.status = TaskStatus(state=TaskState.COMPLETED)
+                elif is_follow_up:
                     # 需要用户补充信息
                     task.status = TaskStatus(
                         state=TaskState.INPUT_REQUIRED,

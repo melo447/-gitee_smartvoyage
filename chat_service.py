@@ -180,6 +180,13 @@ from memory import ConversationMemory  # 记忆管理（短期记忆、用户偏
 
 conf = Config()  # 全局配置实例，包含模型参数、意图映射等
 
+# out_of_scope 且模型未给出追问时的兜底回复，避免用户收到空消息
+OUT_OF_SCOPE_REPLY = (
+    "我可以帮你查询天气，查询或预订机票、高铁票、演出票，"
+    "预订租车、旅游团和旅行保险，也可以推荐景点或规划行程。"
+    "你想先了解哪一项？"
+)
+
 
 class ChatService:
     """
@@ -445,10 +452,11 @@ class ChatService:
         """
         启发式判断：是否可以跳过 planning_agent，直接执行
 
-        判断规则（满足任一即跳过）：
-        1. 单意图：只有一个意图，无需拆解
+        判断规则：
+        0. 含 complex 意图：不跳过，交给 planning_agent 拆解
+        1. 单意图：只有一个意图，无需拆解 → 跳过
         2. 多意图但全部为独立查询类意图（weather/flight/train/concert/attraction），
-           彼此之间无依赖，可以直接并行或串行执行
+           彼此之间无依赖，可以直接并行或串行执行 → 跳过
 
         需要进入 planning 的情况：
         - 包含 order（预订）等需要分步决策的意图
@@ -462,6 +470,12 @@ class ChatService:
         返回值：
             bool: True 表示跳过 planning_agent，False 表示需要调用 planning_agent
         """
+        # 规则0：complex 意图必须进入规划
+        # 意图识别会把"攻略/行程计划"等无法归类的请求标记为 complex，
+        # 若被单意图规则直接跳过，执行层没有对应分支，只会返回"暂不支持此意图"
+        if "complex" in intents:
+            return False
+
         # 规则1：单意图直接跳过
         if len(intents) <= 1:
             return True
@@ -529,6 +543,11 @@ class ChatService:
         返回值：
             str: agent 返回的结果文本
         """
+        # complex 是意图识别给出的"无法归类"标记（如整段行程攻略），
+        # 执行层按景点推荐链路交给大模型直接生成，避免落到"暂不支持此意图"
+        if intent == "complex":
+            intent = "attraction"
+
         # 根据意图类型，从配置中查找对应的 agent 名称
         agent_name = conf.intent.get(intent)
 
@@ -557,12 +576,9 @@ class ChatService:
                 logger.warning(f"未找到代理：{agent_name}")
                 return f"抱歉，{agent_name} 暂时不可用，请稍后重试。"
 
-            # 构建发送给 agent 的消息：结构化传递对话历史和当前查询
-            agent_input = json.dumps({
-                "history": self.memory.get_short_term_text(),
-                "query": query_str
-            }, ensure_ascii=False)
-            msg = Message(content=TextContent(text=agent_input), role=MessageRole.USER)
+            # 只传当前改写后的查询：query_str 已由意图识别结合历史改写为完整表述，
+            # 再叠加整段历史会导致当前问题重复出现，并让子代理被无关上下文干扰
+            msg = Message(content=TextContent(text=query_str), role=MessageRole.USER)
             task = Task(id="task-" + str(uuid.uuid4()), message=msg.to_dict())
 
             # 通过 A2A 协议异步发送任务给子代理
@@ -744,8 +760,8 @@ class ChatService:
 
             # ========== 步骤2：处理特殊情况 ==========
             if "out_of_scope" in intents:
-                # 用户输入超出系统能力范围，返回追问消息
-                response = follow_up_message
+                # 用户输入超出系统能力范围：模型可能返回空追问，这里做兜底
+                response = follow_up_message or OUT_OF_SCOPE_REPLY
             elif follow_up_message != "":
                 # 意图不明确，需要追问用户
                 response = follow_up_message
@@ -897,7 +913,8 @@ class ChatService:
             intents, user_queries, follow_up_message = self.intent_agent(user_input)
 
             if "out_of_scope" in intents:
-                response = follow_up_message
+                # 同 chat()：空追问时返回能力介绍，避免用户收到空消息
+                response = follow_up_message or OUT_OF_SCOPE_REPLY
                 yield response
             elif follow_up_message != "":
                 response = follow_up_message
@@ -953,11 +970,17 @@ class ChatService:
         流式版本的 _call_agent_intent，仅在生成最终回复时使用流式输出
         调用方需要自行收集 yield 的片段拼接为完整回复
         """
+        # 与 _call_agent_intent 保持一致：complex 按景点推荐链路直接生成
+        if intent == "complex":
+            intent = "attraction"
+
         agent_name = conf.intent.get(intent)
 
         if intent == "attraction":
             chain = SmartVoyagePrompts.attraction_prompt() | self.llm
-            async for chunk in chain.astream({"query": query_str}):
+            # attraction_prompt 需要 weather_info 变量，先查目的地天气再生成
+            weather_info = await self._fetch_weather_for_attraction(query_str)
+            async for chunk in chain.astream({"query": query_str, "weather_info": weather_info}):
                 yield chunk.content if hasattr(chunk, 'content') else str(chunk)
 
         elif agent_name:
@@ -970,8 +993,8 @@ class ChatService:
                 logger.warning(f"未找到代理：{agent_name}")
                 yield f"抱歉，{agent_name} 暂时不可用，请稍后重试。"
             else:
-                chat_history = self.memory.get_short_term_text() + f'\nUser: {query_str}'
-                msg = Message(content=TextContent(text=chat_history), role=MessageRole.USER)
+                # 同 _call_agent_intent：只传当前改写后的查询，避免历史重复
+                msg = Message(content=TextContent(text=query_str), role=MessageRole.USER)
                 task = Task(id="task-" + str(uuid.uuid4()), message=msg.to_dict())
 
                 try:
